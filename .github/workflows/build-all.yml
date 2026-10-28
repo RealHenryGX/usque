@@ -21,11 +21,11 @@ permissions:
 
 env:
   ZIG_VERSION: "0.15.2"
+  MUSL_MIRRORS: "https://musl.cc.timfish.dev https://musl.cc"
 
 jobs:
-  # Single place for checks that do not depend on the target architecture.
   verify:
-    name: verify (vet + test, latest go.mod)
+    name: verify (vet + test)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -41,16 +41,12 @@ jobs:
       - name: Toolchain / module state
         run: |
           go version
-          echo "--- go.mod ---"
           head -5 go.mod
           go mod verify
           go mod download
 
-      - name: Vet
-        run: go vet ./...
-
-      - name: Test
-        run: go test ./...
+      - run: go vet ./...
+      - run: go test ./...
 
   build:
     name: linux/${{ matrix.goarch }}${{ matrix.goarm }}
@@ -60,20 +56,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # goarch / goarm / musl (zig) target triplet
-          - { goarch: amd64,    goarm: "",  target: x86_64-linux-musl }
-          - { goarch: "386",    goarm: "",  target: x86-linux-musl }
-          - { goarch: arm64,    goarm: "",  target: aarch64-linux-musl }
-          - { goarch: arm,      goarm: "6", target: arm-linux-musleabihf }
-          - { goarch: arm,      goarm: "7", target: arm-linux-musleabihf }
-          - { goarch: mips,     goarm: "",  target: mips-linux-musl }
-          - { goarch: mipsle,   goarm: "",  target: mipsel-linux-musl }
-          - { goarch: mips64,   goarm: "",  target: mips64-linux-musl }
-          - { goarch: mips64le, goarm: "",  target: mips64el-linux-musl }
-          - { goarch: riscv64,  goarm: "",  target: riscv64-linux-musl }
-          - { goarch: ppc64le,  goarm: "",  target: powerpc64le-linux-musl }
-          - { goarch: s390x,    goarm: "",  target: s390x-linux-musl }
-          - { goarch: loong64,  goarm: "",  target: loongarch64-linux-musl }
+          # goarch / goarm / zig musl target / musl.cc triplet (zig wins when set)
+          - { goarch: amd64,    goarm: "",  zig: x86_64-linux-musl,      muslcc: "" }
+          - { goarch: "386",    goarm: "",  zig: x86-linux-musl,         muslcc: "" }
+          - { goarch: arm64,    goarm: "",  zig: aarch64-linux-musl,     muslcc: "" }
+          - { goarch: arm,      goarm: "6", zig: arm-linux-musleabihf,   muslcc: "" }
+          - { goarch: arm,      goarm: "7", zig: arm-linux-musleabihf,   muslcc: "" }
+          - { goarch: riscv64,  goarm: "",  zig: riscv64-linux-musl,     muslcc: "" }
+          - { goarch: ppc64le,  goarm: "",  zig: powerpc64le-linux-musl, muslcc: "" }
+          - { goarch: s390x,    goarm: "",  zig: s390x-linux-musl,       muslcc: "" }
+          - { goarch: loong64,  goarm: "",  zig: loongarch64-linux-musl, muslcc: "" }
+          # zig ships no musl headers for the mips family -> musl.cc gcc toolchains
+          - { goarch: mips,     goarm: "",  zig: "", muslcc: mips-linux-musl }
+          - { goarch: mipsle,   goarm: "",  zig: "", muslcc: mipsel-linux-musl }
+          - { goarch: mips64,   goarm: "",  zig: "", muslcc: mips64-linux-musl }
+          - { goarch: mips64le, goarm: "",  zig: "", muslcc: mips64el-linux-musl }
 
     env:
       GOOS: linux
@@ -105,7 +102,8 @@ jobs:
             echo "LDFLAGS=-s -w -X github.com/Diniboy1123/usque/cmd.version=$VERSION -X github.com/Diniboy1123/usque/cmd.commit=$COMMIT -X github.com/Diniboy1123/usque/cmd.date=$DATE"
           } >> "$GITHUB_ENV"
 
-      - name: Install zig (musl cross compiler)
+      - name: Install zig
+        if: matrix.zig != ''
         run: |
           curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
             -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
@@ -113,17 +111,40 @@ jobs:
           sudo ln -sf "/opt/zig-x86_64-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig
           zig version
 
+      - name: Install musl cross toolchain
+        if: matrix.muslcc != ''
+        run: |
+          T="${{ matrix.muslcc }}"
+          ok=""
+          for base in $MUSL_MIRRORS; do
+            echo "trying $base"
+            if curl -fsSL --retry 3 --retry-all-errors --retry-delay 5 --connect-timeout 20 --max-time 600 \
+                -o /tmp/musl.tgz "$base/$T-cross.tgz"; then
+              sudo tar xzf /tmp/musl.tgz -C /opt && ok=1 && break
+            fi
+          done
+          test -n "$ok" || { echo "::error::all musl mirrors failed"; exit 1; }
+          test -x "/opt/$T-cross/bin/$T-gcc"
+          "/opt/$T-cross/bin/$T-gcc" --version | head -1
+
       - name: Build
         run: |
           mkdir -p dist
-          # 1) pure-Go build: no libc at all, runs on glibc and musl systems alike
+          # 1) pure Go: no libc at all, runs on glibc and musl systems alike
           CGO_ENABLED=0 go build -trimpath -ldflags "$LDFLAGS" \
             -o "dist/usque_${VERSION}_linux_${ARCH}" .
-          # 2) musl build: cgo, linked statically against musl libc
-          CGO_ENABLED=1 CC="zig cc -target ${{ matrix.target }}" \
-            go build -trimpath -ldflags "$LDFLAGS -linkmode external -extldflags -static" \
-            -o "dist/usque_${VERSION}_linux_${ARCH}-musl" .
-          strip "dist/usque_${VERSION}_linux_${ARCH}-musl" 2>/dev/null || true
+          # 2) musl: cgo, statically linked against musl libc
+          MUSL_OUT="dist/usque_${VERSION}_linux_${ARCH}-musl"
+          if [ -n "${{ matrix.zig }}" ]; then
+            CGO_ENABLED=1 CC="zig cc -target ${{ matrix.zig }}" \
+              go build -trimpath -ldflags "$LDFLAGS -linkmode external -extldflags -static" -o "$MUSL_OUT" .
+            strip "$MUSL_OUT" 2>/dev/null || true
+          else
+            T="${{ matrix.muslcc }}"
+            CGO_ENABLED=1 CC="/opt/$T-cross/bin/$T-gcc" CGO_LDFLAGS="-static" \
+              go build -trimpath -ldflags "$LDFLAGS -linkmode external -extldflags -static" -o "$MUSL_OUT" .
+            "/opt/$T-cross/bin/$T-strip" "$MUSL_OUT" 2>/dev/null || true
+          fi
           ls -l dist
 
       - name: Assert both binaries are static
@@ -134,6 +155,7 @@ jobs:
             if file -b "$f" | grep -qi 'dynamically linked'; then
               echo "::error::$f is dynamically linked"; exit 1
             fi
+            test -s "$f"
           done
 
       - name: Upload per-arch artifacts
@@ -155,10 +177,6 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -173,7 +191,8 @@ jobs:
       - name: Resolve release tag
         id: tag
         run: |
-          if [ "${{ github.event_name }}" = "push" ] && [ "${{ startsWith(github.ref, 'refs/tags/') }}" = "true" ]; then
+          TAGGED="${{ startsWith(github.ref, 'refs/tags/') }}"
+          if [ "$TAGGED" = "true" ]; then
             TAG="${{ github.ref_name }}"; PRE=false
           elif [ -n "${{ inputs.release_tag }}" ]; then
             TAG="${{ inputs.release_tag }}"; PRE=false
@@ -193,6 +212,6 @@ jobs:
           make_latest: ${{ steps.tag.outputs.prerelease == 'false' }}
           fail_on_unmatched_files: true
           body: |
-            Automated build of ${{ github.sha }} (${{ github.event_name }}).
-            <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}>
+            Built from ${{ github.sha }} (${{ github.event_name }}).
+            Run: <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}>
           files: dist/*
