@@ -3,37 +3,79 @@ name: Build (all arches)
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to publish artifacts to (empty = no release)'
+        required: false
+        default: ''
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
+env:
+  ZIG_VERSION: "0.15.2"
+
 jobs:
-  build:
-    name: linux/${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}
+  # Single place for checks that do not depend on the target architecture.
+  verify:
+    name: verify (vet + test, latest go.mod)
     runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Toolchain / module state
+        run: |
+          go version
+          echo "--- go.mod ---"
+          head -5 go.mod
+          go mod verify
+          go mod download
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+  build:
+    name: linux/${{ matrix.goarch }}${{ matrix.goarm }}
+    runs-on: ubuntu-24.04
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { goarch: amd64,   goarm: "",  triple: x86_64-linux-musl }
-          - { goarch: "386",   goarm: "",  triple: i686-linux-musl }
-          - { goarch: arm64,   goarm: "",  triple: aarch64-linux-musl }
-          - { goarch: arm,     goarm: "6", triple: arm-linux-musleabihf }
-          - { goarch: arm,     goarm: "7", triple: arm-linux-musleabihf }
-          - { goarch: mips,    goarm: "",  triple: mips-linux-musl }
-          - { goarch: mipsle,  goarm: "",  triple: mipsel-linux-musl }
-          - { goarch: mips64,  goarm: "",  triple: mips64-linux-musl }
-          - { goarch: mips64le, goarm: "", triple: mips64el-linux-musl }
-          - { goarch: riscv64, goarm: "",  triple: riscv64-linux-musl }
-          - { goarch: ppc64le, goarm: "",  triple: powerpc64le-linux-musl }
-          - { goarch: s390x,   goarm: "",  triple: s390x-linux-musl }
-          # musl.cc has no loongarch64 toolchain: pure-Go build only
-          - { goarch: loong64, goarm: "",  triple: "" }
+          # goarch / goarm / musl (zig) target triplet
+          - { goarch: amd64,    goarm: "",  target: x86_64-linux-musl }
+          - { goarch: "386",    goarm: "",  target: x86-linux-musl }
+          - { goarch: arm64,    goarm: "",  target: aarch64-linux-musl }
+          - { goarch: arm,      goarm: "6", target: arm-linux-musleabihf }
+          - { goarch: arm,      goarm: "7", target: arm-linux-musleabihf }
+          - { goarch: mips,     goarm: "",  target: mips-linux-musl }
+          - { goarch: mipsle,   goarm: "",  target: mipsel-linux-musl }
+          - { goarch: mips64,   goarm: "",  target: mips64-linux-musl }
+          - { goarch: mips64le, goarm: "",  target: mips64el-linux-musl }
+          - { goarch: riscv64,  goarm: "",  target: riscv64-linux-musl }
+          - { goarch: ppc64le,  goarm: "",  target: powerpc64le-linux-musl }
+          - { goarch: s390x,    goarm: "",  target: s390x-linux-musl }
+          - { goarch: loong64,  goarm: "",  target: loongarch64-linux-musl }
 
     env:
-      CGO_ENABLED: "0"
       GOOS: linux
       GOARCH: ${{ matrix.goarch }}
       GOARM: ${{ matrix.goarm }}
@@ -46,9 +88,10 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          check-latest: true
           cache: true
 
-      - name: Compute build metadata
+      - name: Build metadata
         run: |
           VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
           COMMIT=$(git rev-parse --short HEAD)
@@ -62,53 +105,94 @@ jobs:
             echo "LDFLAGS=-s -w -X github.com/Diniboy1123/usque/cmd.version=$VERSION -X github.com/Diniboy1123/usque/cmd.commit=$COMMIT -X github.com/Diniboy1123/usque/cmd.date=$DATE"
           } >> "$GITHUB_ENV"
 
-      - name: go vet + test
+      - name: Install zig (musl cross compiler)
         run: |
-          go vet ./...
-          go test ./...
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          sudo tar xf /tmp/zig.tar.xz -C /opt
+          sudo ln -sf "/opt/zig-x86_64-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig
+          zig version
 
-      - name: Build static (pure Go, no libc dependency)
+      - name: Build
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags "$LDFLAGS" -o "dist/usque_${VERSION}_linux_${ARCH}" .
-          (go tool nm "dist/usque_${VERSION}_linux_${ARCH}" >/dev/null 2>&1 || true)
-          ls -l dist
-
-      - name: Install musl cross toolchain
-        if: matrix.triple != ''
-        run: |
-          curl -fsSL "https://musl.cc/${{ matrix.triple }}-cross.tgz" -o /tmp/musl.tgz
-          sudo tar xzf /tmp/musl.tgz -C /opt
-          ls /opt/${{ matrix.triple }}-cross/bin/ | head
-
-      - name: Build musl (statically linked against musl libc)
-        if: matrix.triple != ''
-        env:
-          CGO_ENABLED: "1"
-          CC: ${{ matrix.triple }}-gcc
-          CGO_LDFLAGS: "-static"
-        run: |
-          export PATH="/opt/${{ matrix.triple }}-cross/bin:$PATH"
-          export CC="/opt/${{ matrix.triple }}-cross/bin/${{ matrix.triple }}-gcc"
-          go build -trimpath -ldflags "$LDFLAGS -linkmode external -extldflags '-static'" \
+          # 1) pure-Go build: no libc at all, runs on glibc and musl systems alike
+          CGO_ENABLED=0 go build -trimpath -ldflags "$LDFLAGS" \
+            -o "dist/usque_${VERSION}_linux_${ARCH}" .
+          # 2) musl build: cgo, linked statically against musl libc
+          CGO_ENABLED=1 CC="zig cc -target ${{ matrix.target }}" \
+            go build -trimpath -ldflags "$LDFLAGS -linkmode external -extldflags -static" \
             -o "dist/usque_${VERSION}_linux_${ARCH}-musl" .
-          /opt/${{ matrix.triple }}-cross/bin/${{ matrix.triple }}-strip "dist/usque_${VERSION}_linux_${ARCH}-musl" || true
-          file "dist/usque_${VERSION}_linux_${ARCH}-musl"
+          strip "dist/usque_${VERSION}_linux_${ARCH}-musl" 2>/dev/null || true
           ls -l dist
 
-      - name: Check binaries are static
+      - name: Assert both binaries are static
         run: |
+          set -e
           for f in dist/*; do
-            if file "$f" | grep -q 'dynamically linked'; then
+            file -b "$f"
+            if file -b "$f" | grep -qi 'dynamically linked'; then
               echo "::error::$f is dynamically linked"; exit 1
             fi
-            file "$f"
           done
 
-      - name: Upload artifacts
+      - name: Upload per-arch artifacts
         uses: actions/upload-artifact@v4
         with:
           name: usque-linux-${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}
           path: dist/*
           if-no-files-found: error
           compression-level: 0
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    if: |
+      startsWith(github.ref, 'refs/tags/') ||
+      (github.event_name == 'workflow_dispatch' && inputs.release_tag != '') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum usque_* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ startsWith(github.ref, 'refs/tags/') }}" = "true" ]; then
+            TAG="${{ github.ref_name }}"; PRE=false
+          elif [ -n "${{ inputs.release_tag }}" ]; then
+            TAG="${{ inputs.release_tag }}"; PRE=false
+          else
+            TAG="latest"; PRE=true
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRE" >> "$GITHUB_OUTPUT"
+          echo "publishing tag=$TAG prerelease=$PRE"
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          prerelease: ${{ steps.tag.outputs.prerelease }}
+          make_latest: ${{ steps.tag.outputs.prerelease == 'false' }}
+          fail_on_unmatched_files: true
+          body: |
+            Automated build of ${{ github.sha }} (${{ github.event_name }}).
+            <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}>
+          files: dist/*
