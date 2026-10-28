@@ -90,7 +90,8 @@ jobs:
 
       - name: Build metadata
         run: |
-          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
+          # --match keeps the rolling 'latest' release tag out of the version string
+          VERSION=$(git describe --tags --match 'v[0-9]*' --always --dirty 2>/dev/null || echo dev)
           COMMIT=$(git rev-parse --short HEAD)
           DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           ARCH="${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}"
