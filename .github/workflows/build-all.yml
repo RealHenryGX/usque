@@ -1,0 +1,114 @@
+name: Build (all arches)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: linux/${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goarch: amd64,   goarm: "",  triple: x86_64-linux-musl }
+          - { goarch: "386",   goarm: "",  triple: i686-linux-musl }
+          - { goarch: arm64,   goarm: "",  triple: aarch64-linux-musl }
+          - { goarch: arm,     goarm: "6", triple: arm-linux-musleabihf }
+          - { goarch: arm,     goarm: "7", triple: arm-linux-musleabihf }
+          - { goarch: mips,    goarm: "",  triple: mips-linux-musl }
+          - { goarch: mipsle,  goarm: "",  triple: mipsel-linux-musl }
+          - { goarch: mips64,  goarm: "",  triple: mips64-linux-musl }
+          - { goarch: mips64le, goarm: "", triple: mips64el-linux-musl }
+          - { goarch: riscv64, goarm: "",  triple: riscv64-linux-musl }
+          - { goarch: ppc64le, goarm: "",  triple: powerpc64le-linux-musl }
+          - { goarch: s390x,   goarm: "",  triple: s390x-linux-musl }
+          # musl.cc has no loongarch64 toolchain: pure-Go build only
+          - { goarch: loong64, goarm: "",  triple: "" }
+
+    env:
+      CGO_ENABLED: "0"
+      GOOS: linux
+      GOARCH: ${{ matrix.goarch }}
+      GOARM: ${{ matrix.goarm }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Compute build metadata
+        run: |
+          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
+          COMMIT=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          ARCH="${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}"
+          {
+            echo "VERSION=$VERSION"
+            echo "COMMIT=$COMMIT"
+            echo "DATE=$DATE"
+            echo "ARCH=$ARCH"
+            echo "LDFLAGS=-s -w -X github.com/Diniboy1123/usque/cmd.version=$VERSION -X github.com/Diniboy1123/usque/cmd.commit=$COMMIT -X github.com/Diniboy1123/usque/cmd.date=$DATE"
+          } >> "$GITHUB_ENV"
+
+      - name: go vet + test
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Build static (pure Go, no libc dependency)
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "$LDFLAGS" -o "dist/usque_${VERSION}_linux_${ARCH}" .
+          (go tool nm "dist/usque_${VERSION}_linux_${ARCH}" >/dev/null 2>&1 || true)
+          ls -l dist
+
+      - name: Install musl cross toolchain
+        if: matrix.triple != ''
+        run: |
+          curl -fsSL "https://musl.cc/${{ matrix.triple }}-cross.tgz" -o /tmp/musl.tgz
+          sudo tar xzf /tmp/musl.tgz -C /opt
+          ls /opt/${{ matrix.triple }}-cross/bin/ | head
+
+      - name: Build musl (statically linked against musl libc)
+        if: matrix.triple != ''
+        env:
+          CGO_ENABLED: "1"
+          CC: ${{ matrix.triple }}-gcc
+          CGO_LDFLAGS: "-static"
+        run: |
+          export PATH="/opt/${{ matrix.triple }}-cross/bin:$PATH"
+          export CC="/opt/${{ matrix.triple }}-cross/bin/${{ matrix.triple }}-gcc"
+          go build -trimpath -ldflags "$LDFLAGS -linkmode external -extldflags '-static'" \
+            -o "dist/usque_${VERSION}_linux_${ARCH}-musl" .
+          /opt/${{ matrix.triple }}-cross/bin/${{ matrix.triple }}-strip "dist/usque_${VERSION}_linux_${ARCH}-musl" || true
+          file "dist/usque_${VERSION}_linux_${ARCH}-musl"
+          ls -l dist
+
+      - name: Check binaries are static
+        run: |
+          for f in dist/*; do
+            if file "$f" | grep -q 'dynamically linked'; then
+              echo "::error::$f is dynamically linked"; exit 1
+            fi
+            file "$f"
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: usque-linux-${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
