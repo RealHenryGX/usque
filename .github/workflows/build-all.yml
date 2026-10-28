@@ -203,6 +203,18 @@ jobs:
           echo "prerelease=$PRE" >> "$GITHUB_OUTPUT"
           echo "publishing tag=$TAG prerelease=$PRE"
 
+      - name: Prune stale assets on the target release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null |
+            while read -r a; do
+              [ -n "$a" ] || continue
+              echo "removing $a"
+              gh release delete-asset "$TAG" "$a" --repo "$GITHUB_REPOSITORY" -y || true
+            done
+
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
