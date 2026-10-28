@@ -1,0 +1,18 @@
+name: probe
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: probe
+        run: |
+          for u in \
+            https://musl.cc/x86_64-linux-musl-cross.tgz \
+            https://more.musl.cc/11.2.1/x86_64-linux-musl/x86_64-linux-musl-cross.tgz \
+            https://ziglang.org/download/index.json ; do
+            echo "=== $u"
+            curl -sSL --retry 3 --retry-all-errors --connect-timeout 20 --max-time 120 \
+              -o /dev/null -w 'code=%{http_code} connect=%{time_connect}s total=%{time_total}s size=%{size_download}\n' "$u" || echo "curl_exit=$?"
+          done
