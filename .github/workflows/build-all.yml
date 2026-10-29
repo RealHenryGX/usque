@@ -126,18 +126,15 @@ jobs:
 
       - name: Sanity-check binaries
         run: |
-          set -e
+          set -eu
           for f in dist/*; do
-            file -b "$f"
-            test -s "$f"
-            case "$f" in
-              *-musl)
-                file -b "$f" | grep -qi 'dynamically linked' && { echo "::error::$f is dynamically linked"; exit 1; } ;;
-            esac
+            test -s "$f" || { echo "::error::$f is empty"; exit 1; }
+            info=$(file -b "$f")
+            echo "$f: $info"
             if [ "${{ matrix.goos }}" = "android" ]; then
-              file -b "$f" | grep -q 'pie executable' || { echo "::error::$f is not a PIE"; exit 1; }
+              case "$info" in *"pie executable"*) ;; *) echo "::error::$f is not a PIE"; exit 1 ;; esac
             else
-              file -b "$f" | grep -qi 'dynamically linked' && { echo "::error::$f is dynamically linked"; exit 1; }
+              case "$info" in *"dynamically linked"*) echo "::error::$f is dynamically linked"; exit 1 ;; esac
             fi
           done
 
