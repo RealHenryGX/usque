@@ -110,9 +110,11 @@ jobs:
 
       - name: Build
         run: |
-          mkdir -p dist
+          # build outside the repo: a file appearing inside the tree while linking
+          # makes Go stamp the binary with +dirty (vcs.modified=true)
+          mkdir -p "$RUNNER_TEMP/out" dist
           export GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" GOARM="${{ matrix.goarm }}"
-          OUT="dist/usque_${VERSION}_${GOOS}_${ARCH}${EXT}"
+          OUT="$RUNNER_TEMP/out/usque_${VERSION}_${GOOS}_${ARCH}${EXT}"
           # 1) pure Go: no libc at all, runs on glibc and musl systems alike
           CGO_ENABLED=0 go build -trimpath -ldflags "$LDFLAGS" -o "$OUT" .
           # 2) musl: cgo, statically linked against musl libc (linux only)
@@ -122,6 +124,7 @@ jobs:
               -o "${OUT%.exe}-musl" .
             strip "${OUT%.exe}-musl" 2>/dev/null || true
           fi
+          mv "$RUNNER_TEMP/out"/* dist/
           ls -l dist
 
       - name: Bundle wintun.dll (Windows only)
@@ -138,13 +141,13 @@ jobs:
             arm64) WARCH=arm64 ;;
             *) echo "::error::unsupported windows arch"; exit 1 ;;
           esac
-          curl -fsSL --retry 5 --retry-all-errors -o wintun.zip             "https://www.wintun.net/builds/wintun-${WINTUN_VERSION}.zip"
-          echo "${WINTUN_SHA256}  wintun.zip" | sha256sum -c -
-          unzip -q -j wintun.zip "wintun/bin/${WARCH}/wintun.dll" -d dist
+          curl -fsSL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/wintun.zip" "https://www.wintun.net/builds/wintun-${WINTUN_VERSION}.zip"
+          echo "${WINTUN_SHA256}  $RUNNER_TEMP/wintun.zip" | sha256sum -c -
+          unzip -q -j "$RUNNER_TEMP/wintun.zip" "wintun/bin/${WARCH}/wintun.dll" -d dist
           file dist/wintun.dll
           cd dist
           zip -q "usque_${VERSION}_windows_${ARCH}.zip" "usque_${VERSION}_windows_${ARCH}.exe" wintun.dll
-          rm -f wintun.dll wintun.zip ../wintun.zip 2>/dev/null || true
+          rm -f wintun.dll
           ls -l
 
       - name: Sanity-check binaries
