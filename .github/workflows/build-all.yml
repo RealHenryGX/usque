@@ -124,6 +124,29 @@ jobs:
           fi
           ls -l dist
 
+      - name: Bundle wintun.dll (Windows only)
+        if: matrix.goos == 'windows'
+        env:
+          WINTUN_VERSION: "0.14.1"
+          # pinned hash of wintun-0.14.1.zip from www.wintun.net (official WireGuard tun driver)
+          WINTUN_SHA256: "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
+        run: |
+          set -eu
+          case "${{ matrix.goarch }}" in
+            amd64) WARCH=amd64 ;;
+            386)   WARCH=x86 ;;
+            arm64) WARCH=arm64 ;;
+            *) echo "::error::unsupported windows arch"; exit 1 ;;
+          esac
+          curl -fsSL --retry 5 --retry-all-errors -o wintun.zip             "https://www.wintun.net/builds/wintun-${WINTUN_VERSION}.zip"
+          echo "${WINTUN_SHA256}  wintun.zip" | sha256sum -c -
+          unzip -q -j wintun.zip "wintun/bin/${WARCH}/wintun.dll" -d dist
+          file dist/wintun.dll
+          cd dist
+          zip -q "usque_${VERSION}_windows_${ARCH}.zip" "usque_${VERSION}_windows_${ARCH}.exe" wintun.dll
+          rm -f wintun.dll wintun.zip ../wintun.zip 2>/dev/null || true
+          ls -l
+
       - name: Sanity-check binaries
         run: |
           set -eu
